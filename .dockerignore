@@ -1,0 +1,6 @@
+venv
+__pycache__
+*.pyc
+received_frames/*
+static/uploads/*
+.git

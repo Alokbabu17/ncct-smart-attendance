@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>NCCT Integrated Training ERP & Attendance</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <style>
+        body { background-color: #f4f6f9; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }
+        .navbar { background-color: #058b2d; }
+        .card { border-radius: 8px; box-shadow: 0 4px 6px rgba(0,0,0,0.05); }
+        .badge-present { background-color: #198754; }
+    </style>
+</head>
+<body>
+
+<nav class="navbar navbar-dark px-4 py-3 mb-4">
+    <span class="navbar-brand mb-0 h1">NCCT Smart Attendance & ERP Portal</span>
+    <span class="text-white-50">VAMNICOM / RICM / ICM Central Gateway</span>
+</nav>
+
+<div class="container-fluid px-4">
+    <div class="row">
+        <!-- Left: Trainee Registration Form -->
+        <div class="col-md-4 mb-4">
+            <div class="card p-4">
+                <h5 class="card-title text-primary mb-3">Register New Trainee</h5>
+                <form action="/register" method="POST" enctype="multipart/form-data">
+                    <div class="mb-3">
+                        <label class="form-label">Trainee ID</label>
+                        <input type="text" name="trainee_id" class="form-control" placeholder="e.g. NCCT-2026-002" required>
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label">Full Name</label>
+                        <input type="text" name="name" class="form-control" placeholder="e.g. Rahul Sharma" required>
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label">Training Course</label>
+                        <select name="course" class="form-select" required>
+                            <option value="Smart Agro & PACS Management">Smart Agro & PACS Management</option>
+                            <option value="Dairy Cooperative Operations">Dairy Cooperative Operations</option>
+                            <option value="Rural SHG Digital Literacy">Rural SHG Digital Literacy</option>
+                            <option value="Cooperative Banking & Audit">Cooperative Banking & Audit</option>
+                        </select>
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label">Training Center</label>
+                        <select name="center" class="form-select" required>
+                            <option value="RICM Bhopal">RICM Bhopal</option>
+                            <option value="VAMNICOM Pune">VAMNICOM Pune</option>
+                            <option value="ICM Lucknow">ICM Lucknow</option>
+                        </select>
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label">Upload Passport/Clear Photo</label>
+                        <input type="file" name="photo" class="form-control" accept="image/*" required>
+                    </div>
+                    <button type="submit" class="btn btn-primary w-100">Enroll & Extract Embedding</button>
+                </form>
+            </div>
+        </div>
+
+        <!-- Right: Real-time Attendance Logs & Enrolled Students -->
+        <div class="col-md-8">
+            <div class="card p-4 mb-4">
+                <div class="d-flex justify-content-between align-items-center mb-3">
+                    <h5 class="card-title text-success mb-0">Live Terminal Attendance Logs</h5>
+                    <button class="btn btn-sm btn-outline-secondary" onclick="location.reload()">Refresh Data</button>
+                </div>
+                <div class="table-responsive">
+                    <table class="table table-hover table-bordered align-middle">
+                        <thead class="table-dark">
+                            <tr>
+                                <th>#</th>
+                                <th>Timestamp</th>
+                                <th>Trainee ID</th>
+                                <th>Name</th>
+                                <th>Course</th>
+                                <th>Center</th>
+                                <th>Status</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {% for log in logs %}
+                            <tr>
+                                <td>{{ log[0] }}</td>
+                                <td>{{ log[4] }}</td>
+                                <td><strong>{{ log[1] }}</strong></td>
+                                <td>{{ log[2] }}</td>
+                                <td>{{ log[3] }}</td>
+                                <td>{{ log[5] }}</td>
+                                <td><span class="badge badge-present">PRESENT</span></td>
+                            </tr>
+                            {% else %}
+                            <tr>
+                                <td colspan="7" class="text-center text-muted py-3">No attendance logged yet. Trigger ESP32 Terminal to test.</td>
+                            </tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+
+            <!-- Enrolled Students View -->
+            <div class="card p-4">
+                <h5 class="card-title text-secondary mb-3">Enrolled Trainees in Database</h5>
+                <div class="table-responsive">
+                    <table class="table table-striped table-bordered align-middle">
+                        <thead>
+                            <tr>
+                                <th>ID</th>
+                                <th>Name</th>
+                                <th>Course</th>
+                                <th>Center</th>
+                                <th>Photo Reference</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {% for t in trainees %}
+                            <tr>
+                                <td>{{ t[1] }}</td>
+                                <td>{{ t[2] }}</td>
+                                <td>{{ t[3] }}</td>
+                                <td>{{ t[4] }}</td>
+                                <td><code>{{ t[5] }}</code></td>
+                            </tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script>
+    // Auto refresh logs every 5 seconds so live attendance appears automatically
+    setInterval(() => {
+        fetch('/api/v1/attendance/latest')
+            .then(res => res.json())
+            .then(data => {
+                // Background poll to check new attendance count
+            });
+    }, 5000);
+</script>
+
+</body>
+</html>
