@@ -1,8 +1,7 @@
 Flask==3.0.3
 gunicorn==22.0.0
 psycopg2-binary==2.9.9
-deepface==0.0.93
-tf-keras==2.16.0
-tensorflow-cpu==2.16.1
+onnxruntime==1.17.3
 opencv-python-headless==4.10.0.84
 numpy<2.0.0
+requests==2.31.0

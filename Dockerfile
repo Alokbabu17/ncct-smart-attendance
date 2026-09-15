@@ -1,27 +1,21 @@
 FROM python:3.10-slim
 
-# System dependencies for OpenCV
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libgl1 \
     libglib2.0-0 \
+    wget \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-# Environment flags for CPU stability
-ENV CUDA_VISIBLE_DEVICES="-1"
-ENV TF_ENABLE_ONEDNN_OPTS="0"
-ENV TF_CPP_MIN_LOG_LEVEL="3"
-ENV TF_USE_LEGACY_KERAS="1"
-
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Pre-download lightweight Facenet512 weights
-RUN python -c "from deepface import DeepFace; DeepFace.build_model('Facenet512')"
+# Download pre-converted ultra-lightweight FaceNet ONNX model (only 88MB)
+RUN mkdir -p /app/models && \
+    wget -O /app/models/facenet.onnx https://github.com/nknytk/face-recognition-onnx/raw/main/models/facenet.onnx
 
 COPY . .
 
-EXPOSE 5000
-
-CMD ["gunicorn", "--bind", "0.0.0.0:5000", "--timeout", "180", "--workers", "1", "--worker-class", "sync", "app:app"]
+# Support both Render dynamic $PORT and default 5000
+CMD ["sh", "-c", "gunicorn --bind 0.0.0.0:${PORT:-5000} --timeout 180 --workers 1 app:app"]

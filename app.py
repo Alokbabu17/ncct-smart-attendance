@@ -1,31 +1,14 @@
 import os
-# Memory aur CPU environment locks sabse pehle
-os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
-os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
-os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
-os.environ["TF_FORCE_GPU_ALLOW_GROWTH"] = "true"
-
-from flask import Flask, request, jsonify, render_template, redirect, url_for
+import cv2
+import numpy as np
+import onnxruntime as ort
 import psycopg2
 import json
-import numpy as np
-import tensorflow as tf
-from deepface import DeepFace
-import gc
-
-# Strict TensorFlow memory limit
-tf.config.set_visible_devices([], 'GPU')
+from flask import Flask, request, jsonify, render_template, redirect, url_for
 
 app = Flask(__name__)
 
-# Preload Facenet512 model at boot to avoid runtime allocation spike
-print("[*] Pre-warming Facenet512 model...")
-try:
-    DeepFace.build_model("Facenet512")
-    print("[✔] Model preloaded successfully.")
-except Exception as e:
-    print(f"[!] Preload warning: {e}")
-
+# --- Cloud Database Configuration ---
 DEFAULT_DB_URL = "postgresql://neondb_owner:npg_8lUcsfNxu9gC@ep-red-sound-b3oxoiux-pooler.c-4.ap-southeast-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require"
 DATABASE_URL = os.environ.get("DATABASE_URL", DEFAULT_DB_URL)
 
@@ -34,18 +17,57 @@ RECEIVED_FOLDER = "received_frames"
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 os.makedirs(RECEIVED_FOLDER, exist_ok=True)
 
+# Load ONNX session (Takes < 100MB RAM)
+MODEL_PATH = "/app/models/facenet.onnx"
+if not os.path.exists(MODEL_PATH):
+    MODEL_PATH = "facenet.onnx"  # Local fallback
+
+ort_session = ort.InferenceSession(MODEL_PATH, providers=['CPUExecutionProvider'])
+face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+
 def get_db_connection():
     return psycopg2.connect(DATABASE_URL)
 
-def cosine_distance(source_rep, test_rep):
-    a = np.array(source_rep)
-    b = np.array(test_rep)
-    dot_product = np.dot(a, b)
+def extract_embedding(image_path):
+    img = cv2.imread(image_path)
+    if img is None:
+        return None
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    faces = face_cascade.detectMultiScale(gray, 1.3, 5)
+
+    if len(faces) > 0:
+        x, y, w, h = faces[0]
+        face = img[y:y+h, x:x+w]
+    else:
+        face = img  # Fallback to full frame
+
+    # FaceNet pre-processing (160x160 RGB, standard normalization)
+    face = cv2.resize(face, (160, 160))
+    face = cv2.cvtColor(face, cv2.COLOR_BGR2RGB).astype(np.float32)
+    mean, std = face.mean(), face.std()
+    face = (face - mean) / std
+    face = np.expand_dims(face, axis=0)
+
+    # ONNX Inference
+    ort_inputs = {ort_session.get_inputs()[0].name: face}
+    ort_outs = ort_session.run(None, ort_inputs)
+    embedding = ort_outs[0][0]
+    
+    # L2 normalize
+    norm = np.linalg.norm(embedding)
+    if norm > 0:
+        embedding = embedding / norm
+    return embedding.tolist()
+
+def cosine_distance(a, b):
+    a = np.array(a)
+    b = np.array(b)
+    dot = np.dot(a, b)
     norm_a = np.linalg.norm(a)
     norm_b = np.linalg.norm(b)
     if norm_a == 0 or norm_b == 0:
         return 1.0
-    return 1 - (dot_product / (norm_a * norm_b))
+    return 1 - (dot / (norm_a * norm_b))
 
 # ----------------- WEB DASHBOARD ROUTES -----------------
 
@@ -53,7 +75,6 @@ def cosine_distance(source_rep, test_rep):
 def dashboard():
     conn = get_db_connection()
     cursor = conn.cursor()
-    
     cursor.execute("""
         SELECT id, trainee_id, trainee_name, course, timestamp, center, status 
         FROM attendance_logs 
@@ -87,14 +108,10 @@ def register_trainee():
     photo_file.save(save_path)
 
     try:
-        # Extract embedding using OpenCV detector
-        embedding_objs = DeepFace.represent(
-            img_path=save_path,
-            model_name="Facenet512",
-            detector_backend="opencv",
-            enforce_detection=True
-        )
-        face_vector = embedding_objs[0]["embedding"]
+        face_vector = extract_embedding(save_path)
+        if face_vector is None:
+            return "Could not process image", 400
+            
         embedding_str = json.dumps(face_vector)
 
         conn = get_db_connection()
@@ -115,15 +132,11 @@ def register_trainee():
         cursor.close()
         conn.close()
 
-        # Explicit garbage collection to free RAM immediately
-        gc.collect()
-
-        print(f"[✔] Cloud DB Registered: {name} ({trainee_id})")
+        print(f"[✔] Trainee Registered: {name} ({trainee_id})")
         return redirect(url_for("dashboard"))
 
     except Exception as e:
-        gc.collect()
-        return f"Face Registration Failed: Ensure clear face in photo. Error: {str(e)}", 400
+        return f"Registration Failed: {str(e)}", 400
 
 # ----------------- HARDWARE API ROUTE -----------------
 
@@ -137,24 +150,9 @@ def verify_attendance():
     file.save(file_path)
 
     try:
-        try:
-            incoming_rep = DeepFace.represent(
-                img_path=file_path,
-                model_name="Facenet512",
-                detector_backend="opencv",
-                enforce_detection=True
-            )
-        except Exception:
-            incoming_rep = DeepFace.represent(
-                img_path=file_path,
-                model_name="Facenet512",
-                detector_backend="skip"
-            )
-
-        if not incoming_rep:
+        target_embedding = extract_embedding(file_path)
+        if target_embedding is None:
             return jsonify({"status": "failed", "matched": False, "message": "Face extraction failed"}), 200
-
-        target_embedding = incoming_rep[0]["embedding"]
 
         conn = get_db_connection()
         cursor = conn.cursor()
@@ -168,13 +166,14 @@ def verify_attendance():
 
         matched_trainee = None
         min_distance = 1.0
-        THRESHOLD = 0.40
+        THRESHOLD = 0.45  # FaceNet Cosine Threshold
 
         for row in rows:
             t_id, name, course, center, emb_str = row
             saved_embedding = json.loads(emb_str)
 
             dist = cosine_distance(target_embedding, saved_embedding)
+            print(f"    --> Candidate: {name} | Distance: {dist:.4f}")
 
             if dist < min_distance:
                 min_distance = dist
@@ -200,7 +199,7 @@ def verify_attendance():
             cursor.close()
             conn.close()
 
-            gc.collect()
+            print(f"[✔] MATCH SUCCESS: {matched_trainee['name']}")
             return jsonify({
                 "status": "success",
                 "matched": True,
@@ -209,7 +208,6 @@ def verify_attendance():
         else:
             cursor.close()
             conn.close()
-            gc.collect()
             return jsonify({
                 "status": "failed",
                 "matched": False,
@@ -217,7 +215,6 @@ def verify_attendance():
             }), 200
 
     except Exception as e:
-        gc.collect()
         return jsonify({"status": "error", "message": str(e)}), 500
 
 if __name__ == "__main__":
