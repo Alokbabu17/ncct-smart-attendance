@@ -11,11 +11,10 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Download pre-converted ultra-lightweight FaceNet ONNX model (only 88MB)
+# Official HuggingFace mirror se verified ONNX model fetch karein
 RUN mkdir -p /app/models && \
-    wget -O /app/models/facenet.onnx https://github.com/nknytk/face-recognition-onnx/raw/main/models/facenet.onnx
+    wget -O /app/models/facenet.onnx https://huggingface.co/qualcomm/FaceNet/resolve/main/facenet.onnx
 
 COPY . .
 
-# Support both Render dynamic $PORT and default 5000
 CMD ["sh", "-c", "gunicorn --bind 0.0.0.0:${PORT:-5000} --timeout 180 --workers 1 app:app"]
