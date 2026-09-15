@@ -1,7 +1,6 @@
 import os
 import cv2
 import numpy as np
-import onnxruntime as ort
 import psycopg2
 import json
 from flask import Flask, request, jsonify, render_template, redirect, url_for
@@ -17,13 +16,10 @@ RECEIVED_FOLDER = "received_frames"
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 os.makedirs(RECEIVED_FOLDER, exist_ok=True)
 
-# Load ONNX session (Takes < 100MB RAM)
-MODEL_PATH = "/app/models/facenet.onnx"
-if not os.path.exists(MODEL_PATH):
-    MODEL_PATH = "facenet.onnx"  # Local fallback
-
-ort_session = ort.InferenceSession(MODEL_PATH, providers=['CPUExecutionProvider'])
-face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+# Load SFace Model via OpenCV DNN (Takes < 40MB RAM)
+MODEL_PATH = os.path.join(os.path.dirname(__file__), "models", "sface.onnx")
+recognizer = cv2.FaceRecognizerSF.create(MODEL_PATH, "")
+face_detector = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
 
 def get_db_connection():
     return psycopg2.connect(DATABASE_URL)
@@ -32,42 +28,27 @@ def extract_embedding(image_path):
     img = cv2.imread(image_path)
     if img is None:
         return None
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    faces = face_cascade.detectMultiScale(gray, 1.3, 5)
-
-    if len(faces) > 0:
-        x, y, w, h = faces[0]
-        face = img[y:y+h, x:x+w]
-    else:
-        face = img  # Fallback to full frame
-
-    # FaceNet pre-processing (160x160 RGB, standard normalization)
-    face = cv2.resize(face, (160, 160))
-    face = cv2.cvtColor(face, cv2.COLOR_BGR2RGB).astype(np.float32)
-    mean, std = face.mean(), face.std()
-    face = (face - mean) / std
-    face = np.expand_dims(face, axis=0)
-
-    # ONNX Inference
-    ort_inputs = {ort_session.get_inputs()[0].name: face}
-    ort_outs = ort_session.run(None, ort_inputs)
-    embedding = ort_outs[0][0]
     
-    # L2 normalize
-    norm = np.linalg.norm(embedding)
-    if norm > 0:
-        embedding = embedding / norm
-    return embedding.tolist()
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    faces = face_detector.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=4, minSize=(60, 60))
+
+    if len(faces) == 0:
+        # Fallback to center crop if haar misses
+        h, w = img.shape[:2]
+        crop_box = np.array([[w * 0.1, h * 0.1, w * 0.8, h * 0.8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]], dtype=np.float32)
+        aligned_face = recognizer.alignCrop(img, crop_box)
+    else:
+        x, y, w, h = faces[0]
+        dummy_face = np.array([[x, y, w, h, x, y, x+w, y, x+w/2, y+h/2, x, y+h, x+w, y+h]], dtype=np.float32)
+        aligned_face = recognizer.alignCrop(img, dummy_face)
+
+    embedding = recognizer.feature(aligned_face)
+    return embedding.flatten().tolist()
 
 def cosine_distance(a, b):
-    a = np.array(a)
-    b = np.array(b)
-    dot = np.dot(a, b)
-    norm_a = np.linalg.norm(a)
-    norm_b = np.linalg.norm(b)
-    if norm_a == 0 or norm_b == 0:
-        return 1.0
-    return 1 - (dot / (norm_a * norm_b))
+    vec_a = np.array(a, dtype=np.float32)
+    vec_b = np.array(b, dtype=np.float32)
+    return float(recognizer.match(vec_a, vec_b, cv2.FaceRecognizerSF_FR_COSINE))
 
 # ----------------- WEB DASHBOARD ROUTES -----------------
 
@@ -110,8 +91,8 @@ def register_trainee():
     try:
         face_vector = extract_embedding(save_path)
         if face_vector is None:
-            return "Could not process image", 400
-            
+            return "Could not process face image", 400
+
         embedding_str = json.dumps(face_vector)
 
         conn = get_db_connection()
@@ -132,11 +113,11 @@ def register_trainee():
         cursor.close()
         conn.close()
 
-        print(f"[✔] Trainee Registered: {name} ({trainee_id})")
+        print(f"[✔] Registered: {name} ({trainee_id})")
         return redirect(url_for("dashboard"))
 
     except Exception as e:
-        return f"Registration Failed: {str(e)}", 400
+        return f"Registration Error: {str(e)}", 400
 
 # ----------------- HARDWARE API ROUTE -----------------
 
@@ -165,19 +146,20 @@ def verify_attendance():
             return jsonify({"status": "failed", "matched": False, "message": "No registered trainees"}), 200
 
         matched_trainee = None
-        min_distance = 1.0
-        THRESHOLD = 0.45  # FaceNet Cosine Threshold
+        best_score = 0.0
+        # OpenCV SFace Cosine: higher score is a better match (Threshold: 0.363)
+        THRESHOLD = 0.363
 
         for row in rows:
             t_id, name, course, center, emb_str = row
             saved_embedding = json.loads(emb_str)
 
-            dist = cosine_distance(target_embedding, saved_embedding)
-            print(f"    --> Candidate: {name} | Distance: {dist:.4f}")
+            score = cosine_distance(target_embedding, saved_embedding)
+            print(f"    --> Candidate: {name} | Match Score: {score:.4f}")
 
-            if dist < min_distance:
-                min_distance = dist
-                if dist <= THRESHOLD:
+            if score > best_score:
+                best_score = score
+                if score >= THRESHOLD:
                     matched_trainee = {
                         "trainee_id": t_id,
                         "name": name,
