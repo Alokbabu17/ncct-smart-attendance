@@ -8,7 +8,6 @@ import os
 app = Flask(__name__)
 
 # --- Cloud Database Configuration ---
-# Cloud environment variable se uthayega, nahi milne par aapki Neon connection string use karega
 DEFAULT_DB_URL = "postgresql://neondb_owner:npg_8lUcsfNxu9gC@ep-red-sound-b3oxoiux-pooler.c-4.ap-southeast-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require"
 DATABASE_URL = os.environ.get("DATABASE_URL", DEFAULT_DB_URL)
 
@@ -72,10 +71,10 @@ def register_trainee():
     photo_file.save(save_path)
 
     try:
-        # Extract facial embedding with face crop
+        # Extract facial embedding with Facenet512 (Ultra Lightweight)
         embedding_objs = DeepFace.represent(
             img_path=save_path,
-            model_name="VGG-Face",
+            model_name="Facenet512",
             detector_backend="opencv",
             enforce_detection=True
         )
@@ -126,14 +125,14 @@ def verify_attendance():
         try:
             incoming_rep = DeepFace.represent(
                 img_path=file_path,
-                model_name="VGG-Face",
+                model_name="Facenet512",
                 detector_backend="opencv",
                 enforce_detection=True
             )
         except Exception:
             incoming_rep = DeepFace.represent(
                 img_path=file_path,
-                model_name="VGG-Face",
+                model_name="Facenet512",
                 detector_backend="skip"
             )
 
@@ -156,7 +155,8 @@ def verify_attendance():
 
         matched_trainee = None
         min_distance = 1.0
-        THRESHOLD = 0.58
+        # Facenet512 Cosine Distance threshold: 0.40
+        THRESHOLD = 0.40
 
         for row in rows:
             t_id, name, course, center, emb_str = row
@@ -176,7 +176,6 @@ def verify_attendance():
                     }
 
         if matched_trainee:
-            # Insert attendance log into Cloud DB
             cursor.execute("""
                 INSERT INTO attendance_logs (trainee_id, trainee_name, course, center, status)
                 VALUES (%s, %s, %s, %s, 'PRESENT')
@@ -211,7 +210,6 @@ def verify_attendance():
         return jsonify({"status": "error", "message": str(e)}), 500
 
 if __name__ == "__main__":
-    # Render ya local host dono par automatically correct port bind karega
     port = int(os.environ.get("PORT", 5000))
     print(f"[*] NCCT Server running on port {port}...")
     app.run(host="0.0.0.0", port=port, debug=False)

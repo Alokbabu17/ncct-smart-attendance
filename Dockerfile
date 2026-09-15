@@ -1,6 +1,5 @@
 FROM python:3.10-slim
 
-# System dependencies for OpenCV and Image processing
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libgl1 \
     libglib2.0-0 \
@@ -8,18 +7,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-# Install python packages
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Pre-download VGG-Face weights taaki runtime par download na karna pade
-RUN python -c "from deepface import DeepFace; DeepFace.build_model('VGG-Face')"
+# Pre-download lightweight Facenet512 weights during Docker build
+RUN python -c "from deepface import DeepFace; DeepFace.build_model('Facenet512')"
 
-# Copy app code
 COPY . .
 
-# Expose port
 EXPOSE 5000
 
-# Run with Gunicorn production WSGI server
-CMD ["gunicorn", "--bind", "0.0.0.0:5000", "--timeout", "120", "--workers", "1", "app:app"]
+# Single worker with 2 threads to keep RAM under 300MB
+CMD ["gunicorn", "--bind", "0.0.0.0:5000", "--timeout", "120", "--workers", "1", "--threads", "2", "app:app"]
