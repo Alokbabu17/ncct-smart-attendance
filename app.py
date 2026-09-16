@@ -8,7 +8,6 @@ from flask import Flask, request, jsonify, render_template, redirect, url_for
 
 app = Flask(__name__)
 
-# --- Cloud Database Configuration ---
 DEFAULT_DB_URL = "postgresql://neondb_owner:npg_8lUcsfNxu9gC@ep-red-sound-b3oxoiux-pooler.c-4.ap-southeast-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require"
 DATABASE_URL = os.environ.get("DATABASE_URL", DEFAULT_DB_URL)
 
@@ -17,7 +16,7 @@ RECEIVED_FOLDER = "received_frames"
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 os.makedirs(RECEIVED_FOLDER, exist_ok=True)
 
-# Load SFace & YuNet Models (< 50MB RAM footprint)
+# Load SFace & YuNet Models
 SFACE_PATH = os.path.join(os.path.dirname(__file__), "models", "sface.onnx")
 YUNET_PATH = os.path.join(os.path.dirname(__file__), "models", "face_detection_yunet.onnx")
 
@@ -46,11 +45,22 @@ def extract_embedding(image_path):
     return feature.flatten().tolist()
 
 def match_cosine(a, b):
-    vec_a = np.array(a, dtype=np.float32)
-    vec_b = np.array(b, dtype=np.float32)
-    return float(recognizer.match(vec_a, vec_b, cv2.FaceRecognizerSF_FR_COSINE))
+    # Pure NumPy implementation: Immune to C++ OpenCV shape assertion crashes
+    vec_a = np.array(a, dtype=np.float32).flatten()
+    vec_b = np.array(b, dtype=np.float32).flatten()
+    
+    if vec_a.shape != vec_b.shape:
+        return -1.0  # Dimension mismatch (Old model embedding)
 
-# --- KEEP-ALIVE ROUTE (Anti-Sleep) ---
+    dot_product = np.dot(vec_a, vec_b)
+    norm_a = np.linalg.norm(vec_a)
+    norm_b = np.linalg.norm(vec_b)
+
+    if norm_a == 0 or norm_b == 0:
+        return 0.0
+    return float(dot_product / (norm_a * norm_b))
+
+# --- KEEP-ALIVE ROUTE ---
 @app.route("/ping", methods=["GET"])
 def ping():
     return jsonify({"status": "alive", "server": "NCCT Production API"}), 200
@@ -96,7 +106,7 @@ def register_trainee():
     try:
         face_vector = extract_embedding(save_path)
         if face_vector is None:
-            return "Registration Failed: Clear face not detected. Please upload a clear photo.", 400
+            return "Registration Failed: Clear face not detected. Please upload a clear frontal photo.", 400
 
         embedding_str = json.dumps(face_vector)
 
@@ -118,7 +128,7 @@ def register_trainee():
         cursor.close()
         conn.close()
 
-        print(f"[✔] Registered: {name} ({trainee_id})", flush=True)
+        print(f"[✔] Registered: {name} ({trainee_id}) [Vector len: {len(face_vector)}]", flush=True)
         return redirect(url_for("dashboard"))
 
     except Exception as e:
@@ -134,7 +144,7 @@ def verify_attendance():
     print("==========================================", flush=True)
 
     if "image" not in request.files:
-        print("[-] Rejected: No image payload in request", flush=True)
+        print("[-] Rejected: No image sent", flush=True)
         return jsonify({"status": "failed", "matched": False, "message": "No image sent"}), 400
 
     file = request.files["image"]
@@ -144,7 +154,7 @@ def verify_attendance():
     try:
         target_embedding = extract_embedding(file_path)
         if target_embedding is None:
-            print("[-] Match Aborted: Face not detected clearly in camera frame", flush=True)
+            print("[-] Verification Failed: Face not detected in camera frame", flush=True)
             return jsonify({"status": "failed", "matched": False, "message": "Face not detected clearly"}), 200
 
         conn = get_db_connection()
@@ -155,19 +165,24 @@ def verify_attendance():
         if not rows:
             cursor.close()
             conn.close()
-            print("[-] Warning: Database has 0 registered trainees", flush=True)
+            print("[-] Warning: No registered trainees in DB", flush=True)
             return jsonify({"status": "failed", "matched": False, "message": "No registered trainees"}), 200
 
         matched_trainee = None
         best_score = -1.0
-        THRESHOLD = 0.28  # Tuned for real-world ESP32 camera
+        THRESHOLD = 0.30  # Practical cosine similarity for SFace
 
         for row in rows:
             t_id, name, course, center, emb_str = row
             saved_embedding = json.loads(emb_str)
 
+            # Check for legacy vector mismatch
+            if len(saved_embedding) != len(target_embedding):
+                print(f"    --> [!] Skipping {name}: Outdated embedding size ({len(saved_embedding)} vs {len(target_embedding)}). Needs re-registration!", flush=True)
+                continue
+
             score = match_cosine(target_embedding, saved_embedding)
-            print(f"    --> Comparing with: {name} | Match Score: {score:.4f} (Threshold: {THRESHOLD})", flush=True)
+            print(f"    --> Candidate: {name} | Cosine Match Score: {score:.4f} (Threshold: {THRESHOLD})", flush=True)
 
             if score > best_score:
                 best_score = score
@@ -193,7 +208,7 @@ def verify_attendance():
             cursor.close()
             conn.close()
 
-            print(f"[✔] Attendance SUCCESS: {matched_trainee['name']} marked PRESENT (Score: {best_score:.4f})", flush=True)
+            print(f"[✔] MATCH SUCCESS: {matched_trainee['name']} marked PRESENT (Score: {best_score:.4f})", flush=True)
             return jsonify({
                 "status": "success",
                 "matched": True,
@@ -202,7 +217,7 @@ def verify_attendance():
         else:
             cursor.close()
             conn.close()
-            print(f"[-] Attendance REJECTED: Best score {best_score:.4f} < {THRESHOLD}", flush=True)
+            print(f"[-] REJECTED: Best score {best_score:.4f} < {THRESHOLD}", flush=True)
             return jsonify({
                 "status": "failed",
                 "matched": False,
@@ -210,7 +225,7 @@ def verify_attendance():
             }), 200
 
     except Exception as e:
-        print(f"[-] Fatal Exception in verify route: {str(e)}", flush=True)
+        print(f"[-] Fatal Exception: {str(e)}", flush=True)
         return jsonify({"status": "error", "message": str(e)}), 500
 
 if __name__ == "__main__":
