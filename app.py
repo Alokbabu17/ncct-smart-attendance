@@ -1,4 +1,5 @@
 import os
+import sys
 import cv2
 import numpy as np
 import psycopg2
@@ -16,10 +17,12 @@ RECEIVED_FOLDER = "received_frames"
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 os.makedirs(RECEIVED_FOLDER, exist_ok=True)
 
-# Load SFace Model via OpenCV DNN (Takes < 40MB RAM)
-MODEL_PATH = os.path.join(os.path.dirname(__file__), "models", "sface.onnx")
-recognizer = cv2.FaceRecognizerSF.create(MODEL_PATH, "")
-face_detector = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+# Load SFace & YuNet Models (< 50MB RAM footprint)
+SFACE_PATH = os.path.join(os.path.dirname(__file__), "models", "sface.onnx")
+YUNET_PATH = os.path.join(os.path.dirname(__file__), "models", "face_detection_yunet.onnx")
+
+recognizer = cv2.FaceRecognizerSF.create(SFACE_PATH, "")
+detector = cv2.FaceDetectorYN.create(YUNET_PATH, "", (320, 320), score_threshold=0.3, nms_threshold=0.3)
 
 def get_db_connection():
     return psycopg2.connect(DATABASE_URL)
@@ -27,28 +30,30 @@ def get_db_connection():
 def extract_embedding(image_path):
     img = cv2.imread(image_path)
     if img is None:
+        print(f"[-] Error: Image could not be loaded from {image_path}", flush=True)
         return None
-    
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    faces = face_detector.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=4, minSize=(60, 60))
 
-    if len(faces) == 0:
-        # Fallback to center crop if haar misses
-        h, w = img.shape[:2]
-        crop_box = np.array([[w * 0.1, h * 0.1, w * 0.8, h * 0.8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]], dtype=np.float32)
-        aligned_face = recognizer.alignCrop(img, crop_box)
-    else:
-        x, y, w, h = faces[0]
-        dummy_face = np.array([[x, y, w, h, x, y, x+w, y, x+w/2, y+h/2, x, y+h, x+w, y+h]], dtype=np.float32)
-        aligned_face = recognizer.alignCrop(img, dummy_face)
+    h, w, _ = img.shape
+    detector.setInputSize((w, h))
+    _, faces = detector.detect(img)
 
-    embedding = recognizer.feature(aligned_face)
-    return embedding.flatten().tolist()
+    if faces is None or len(faces) == 0:
+        print(f"[-] Detection Warning: No face detected in frame", flush=True)
+        return None
 
-def cosine_distance(a, b):
+    aligned_face = recognizer.alignCrop(img, faces[0])
+    feature = recognizer.feature(aligned_face)
+    return feature.flatten().tolist()
+
+def match_cosine(a, b):
     vec_a = np.array(a, dtype=np.float32)
     vec_b = np.array(b, dtype=np.float32)
     return float(recognizer.match(vec_a, vec_b, cv2.FaceRecognizerSF_FR_COSINE))
+
+# --- KEEP-ALIVE ROUTE (Anti-Sleep) ---
+@app.route("/ping", methods=["GET"])
+def ping():
+    return jsonify({"status": "alive", "server": "NCCT Production API"}), 200
 
 # ----------------- WEB DASHBOARD ROUTES -----------------
 
@@ -91,7 +96,7 @@ def register_trainee():
     try:
         face_vector = extract_embedding(save_path)
         if face_vector is None:
-            return "Could not process face image", 400
+            return "Registration Failed: Clear face not detected. Please upload a clear photo.", 400
 
         embedding_str = json.dumps(face_vector)
 
@@ -113,17 +118,23 @@ def register_trainee():
         cursor.close()
         conn.close()
 
-        print(f"[✔] Registered: {name} ({trainee_id})")
+        print(f"[✔] Registered: {name} ({trainee_id})", flush=True)
         return redirect(url_for("dashboard"))
 
     except Exception as e:
-        return f"Registration Error: {str(e)}", 400
+        print(f"[-] Registration Error: {str(e)}", flush=True)
+        return f"Error: {str(e)}", 400
 
 # ----------------- HARDWARE API ROUTE -----------------
 
 @app.route("/api/v1/attendance/verify", methods=["POST"])
 def verify_attendance():
+    print("\n==========================================", flush=True)
+    print("🔔 [EVENT] New Attendance Scan Received!", flush=True)
+    print("==========================================", flush=True)
+
     if "image" not in request.files:
+        print("[-] Rejected: No image payload in request", flush=True)
         return jsonify({"status": "failed", "matched": False, "message": "No image sent"}), 400
 
     file = request.files["image"]
@@ -133,7 +144,8 @@ def verify_attendance():
     try:
         target_embedding = extract_embedding(file_path)
         if target_embedding is None:
-            return jsonify({"status": "failed", "matched": False, "message": "Face extraction failed"}), 200
+            print("[-] Match Aborted: Face not detected clearly in camera frame", flush=True)
+            return jsonify({"status": "failed", "matched": False, "message": "Face not detected clearly"}), 200
 
         conn = get_db_connection()
         cursor = conn.cursor()
@@ -143,19 +155,19 @@ def verify_attendance():
         if not rows:
             cursor.close()
             conn.close()
+            print("[-] Warning: Database has 0 registered trainees", flush=True)
             return jsonify({"status": "failed", "matched": False, "message": "No registered trainees"}), 200
 
         matched_trainee = None
-        best_score = 0.0
-        # OpenCV SFace Cosine: higher score is a better match (Threshold: 0.363)
-        THRESHOLD = 0.363
+        best_score = -1.0
+        THRESHOLD = 0.28  # Tuned for real-world ESP32 camera
 
         for row in rows:
             t_id, name, course, center, emb_str = row
             saved_embedding = json.loads(emb_str)
 
-            score = cosine_distance(target_embedding, saved_embedding)
-            print(f"    --> Candidate: {name} | Match Score: {score:.4f}")
+            score = match_cosine(target_embedding, saved_embedding)
+            print(f"    --> Comparing with: {name} | Match Score: {score:.4f} (Threshold: {THRESHOLD})", flush=True)
 
             if score > best_score:
                 best_score = score
@@ -181,7 +193,7 @@ def verify_attendance():
             cursor.close()
             conn.close()
 
-            print(f"[✔] MATCH SUCCESS: {matched_trainee['name']}")
+            print(f"[✔] Attendance SUCCESS: {matched_trainee['name']} marked PRESENT (Score: {best_score:.4f})", flush=True)
             return jsonify({
                 "status": "success",
                 "matched": True,
@@ -190,6 +202,7 @@ def verify_attendance():
         else:
             cursor.close()
             conn.close()
+            print(f"[-] Attendance REJECTED: Best score {best_score:.4f} < {THRESHOLD}", flush=True)
             return jsonify({
                 "status": "failed",
                 "matched": False,
@@ -197,6 +210,7 @@ def verify_attendance():
             }), 200
 
     except Exception as e:
+        print(f"[-] Fatal Exception in verify route: {str(e)}", flush=True)
         return jsonify({"status": "error", "message": str(e)}), 500
 
 if __name__ == "__main__":
